@@ -19,7 +19,7 @@ LIDAR_MAX_RANGE = 10.0       # 최대 감지 거리 (미터)
 FRONT_ANGLE_MIN = -30        # 우측 30도 (음수 각도)
 FRONT_ANGLE_MAX = 30         # 좌측 30도 (양수 각도)
 
-CONE_DETECT_RANGE = 6.5      # 라바콘 감지 최대 거리 (미터) (늘림)
+CONE_DETECT_RANGE = 4.0      # 라바콘 감지 최대 거리 (미터)
 CONE_MIN_POINTS = 2          # 라바콘 판별 최소 점 수 (줄임)
 
 OBSTACLE_NEAR_RANGE = 2.5    # 근접 장애물 임계 거리 (미터)
@@ -131,20 +131,13 @@ class ObstacleDetector:
                 angle_deg -= 360
 
             dist = ranges[i]
-
             if not (0.1 < dist < CONE_DETECT_RANGE and np.isfinite(dist)):
                 continue
 
-            # 극좌표 -> 직교좌표 (x, y) 변환 및 가로 오프셋(x) 기준 도로 바깥 장애물 필터링
-            angle_rad = math.radians(angle_deg)
-            x = dist * math.sin(angle_rad)
-            if abs(x) >= 1.3:
-                continue
-
             # 양수 각도는 좌측, 음수 각도는 우측 (시야 확장)
-            if 0 < angle_deg <= 75:
+            if 0 < angle_deg <= 90:
                 left_points.append(dist)
-            elif -75 <= angle_deg < 0:
+            elif -90 <= angle_deg < 0:
                 right_points.append(dist)
 
         if len(left_points) >= CONE_MIN_POINTS and len(right_points) >= CONE_MIN_POINTS:

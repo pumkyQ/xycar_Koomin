@@ -57,8 +57,8 @@ class TrackDriverNode(Node):
         self.wheelbase = 0.33
         self.focal_length = 350.0
         self.steer_gain = 4.0       # 최근 피드백 조향 감도(4.0) 적용
-        self.lookahead_min = 0.4    # 최소 전방주시거리 (급커브 대응)
-        self.lookahead_max = 1.6    # 최대 전방주시거리 (직진 안정성 확보, 기존 1.3에서 상향)
+        self.lookahead_min = 0.5    # 최소 전방주시거리 (급커브 대응)
+        self.lookahead_max = 1.8    # 최대 전방주시거리 (직진 안정성 확보, 기존 1.3에서 상향)
         
         # 속도 기본값 설정 (동적 속도 제어 범위)
         self.speed_max = 10.0      # 직진 최고 속도
@@ -74,7 +74,7 @@ class TrackDriverNode(Node):
         self.last_lap_time = time.time()
 
         # 조향 PID 필터 파라미터 및 상태 변수
-        self.steer_kp = 0.45
+        self.steer_kp = 0.60
         self.steer_kd = 0.15
         self.steer_ki = 0.02
         self.prev_steer = 0.0
@@ -103,11 +103,11 @@ class TrackDriverNode(Node):
     def drive(self, angle, speed):
         """
         차량 제어 토픽(xycar_motor)을 발행합니다.
-        - angle: 사용자 입력 조향각 (물리 제어 범위: 좌측 최대 -100, 우측 최대 42)
+        - angle: 사용자 입력 조향각 (물리 제어 범위: 좌측 최대 -100, 우측 최대 100)
         - speed: 주행 속도
         """
         # 조향이 최대로 꺾이도록 0.5배 스케일링을 제거하고 물리적 최대 조향각 적용
-        clamped_angle = max(-100.0, min(42.0, angle))
+        clamped_angle = max(-100.0, min(100.0, angle))
         
         self.motor_msg.angle = float(clamped_angle)
         self.motor_msg.speed = float(speed)
@@ -126,7 +126,7 @@ class TrackDriverNode(Node):
         speed = self.motor_msg.speed
         
         # 속도 기반 동적 전방주시거리(Lookahead Distance) 계산 (직진 및 코너링 동적 튜닝)
-        lookahead_distance = max(self.lookahead_min, min(self.lookahead_max, 0.3 + 0.06 * speed)) 
+        lookahead_distance = max(self.lookahead_min, min(self.lookahead_max, 0.4 + 0.08 * speed)) 
         
         # 퓨어퍼슛 조향각 계산 공식 (원근 투영 비례 축소 반영)
         delta = math.atan2(2.0 * self.wheelbase * e_x, self.focal_length * lookahead_distance)
@@ -148,7 +148,7 @@ class TrackDriverNode(Node):
 
     def _count_detected_cones(self):
         """
-        LIDAR 데이터를 클러스터링하여 전방 6.5m 내 좌우 75도 이내 감지된 라바콘의 개수를 반환합니다.
+        LIDAR 데이터를 클러스터링하여 전방 4.0m 내 좌우 90도(총 180도) 이내 감지된 라바콘의 개수를 반환합니다.
         """
         if self.lidar_ranges is None:
             return 0
@@ -166,17 +166,15 @@ class TrackDriverNode(Node):
             if angle_deg > 180:
                 angle_deg -= 360
 
-            # 전방 좌우 75도 범위 및 6.5m 이내
-            if -75 <= angle_deg <= 75:
+            # 전방 좌우 90도 범위 및 4.0m 이내
+            if -90 <= angle_deg <= 90:
                 dist = ranges[i]
-                if 0.1 < dist < 6.5 and np.isfinite(dist):
+                if 0.1 < dist < 4.0 and np.isfinite(dist):
                     # 극좌표 -> 직교좌표 (x, y) 변환
                     angle_rad = math.radians(angle_deg)
                     x = dist * math.sin(angle_rad) # 가로
                     y = dist * math.cos(angle_rad) # 세로
-                    # 도로 바깥의 장애물(나무 등) 필터링 (좌우 1.3m 이내만)
-                    if abs(x) < 1.3:
-                        points.append((x, y))
+                    points.append((x, y))
 
         if not points:
             return 0
@@ -198,6 +196,32 @@ class TrackDriverNode(Node):
         # 각 클러스터의 포인트 개수가 최소 2개 이상인 것만 유효한 라바콘으로 판정
         valid_cones = [c for c in clusters if len(c) >= 2]
         return len(valid_cones)
+
+    def _is_road_in_front_0_5m(self):
+        """
+        차량 전방 약 0.5m 부근 (이미지 하단 중앙 영역)에 검은색 도로가 보이고,
+        차선 인식 모듈에서 유효한 차선이 감지되는지 여부를 판단합니다.
+        """
+        if self.image is None:
+            return False
+        
+        h, w = self.image.shape[:2]
+        # 전방 0.5m 부근 ROI (하단 80% ~ 95% 행, 가로 중앙 35% ~ 65% 열)
+        bottom_roi = self.image[int(h * 0.8):int(h * 0.95), int(w * 0.35):int(w * 0.65)]
+        hsv = cv2.cvtColor(bottom_roi, cv2.COLOR_BGR2HSV)
+        
+        # 검은색/어두운 회색 도로 HSV 범위
+        lower_road = np.array([0, 0, 30])
+        upper_road = np.array([180, 50, 160])
+        road_mask = cv2.inRange(hsv, lower_road, upper_road)
+        
+        total_pixels = bottom_roi.shape[0] * bottom_roi.shape[1]
+        road_pixels = cv2.countNonZero(road_mask)
+        road_ratio = road_pixels / total_pixels
+        
+        # 도로 면적이 30% 이상이고, 차선 검출기가 유효 차선을 보고 있을 때 True
+        lane_visible = (self.lane_detector.no_lane_count == 0)
+        return (road_ratio > 0.30) and lane_visible
 
     #====================================================================
     # [FSM State Transitions]
@@ -267,23 +291,20 @@ class TrackDriverNode(Node):
             self.get_logger().info(f"[LIDAR DETECT] Cones counted in front: {num_cones}")
             self.last_cone_log_time = current_time
         
-        # 라바콘이 4개 이상 검출될 경우 문코스(CONE_DRIVING) 주행
-        if num_cones >= 4:
-            if self.current_drive_state != DriveState.CONE_DRIVING:
-                self.get_logger().info(f"★ 라바콘 {num_cones}개 감지 ➔ 문코스(CONE_DRIVING) 주행 시작")
+        # 현재 FSM 상태에 기반한 세부 분기 전이 제어
+        if self.current_drive_state == DriveState.CONE_DRIVING:
+            # 전방 0.5m에 검은색 도로가 나타나고, 디텍된 콘이 2개 이하가 되면 라인 주행으로 이탈 방지 복귀
+            if num_cones <= 2 and self._is_road_in_front_0_5m():
+                self.get_logger().info("★ 검은색 도로 감지 및 콘 2개 이하 ➔ 차선(LANE_DRIVING) 주행으로 안정 복귀")
+                return DriveState.LANE_DRIVING
             return DriveState.CONE_DRIVING
-
-        # 그 이하이고 차선이 보일 때 차선주행 (no_lane_count가 0이면 차선 감지됨)
-        lane_visible = (self.lane_detector.no_lane_count == 0)
-        if lane_visible:
-            if self.current_drive_state != DriveState.LANE_DRIVING:
-                self.get_logger().info("★ 차선 감지 ➔ 차선(LANE_DRIVING) 주행 시작")
+        else:
+            # 차선 주행 상태에서는 콘이 4개 이상으로 증대되면 콘 회피 주행 진입
+            if num_cones >= 4:
+                if self.current_drive_state != DriveState.CONE_DRIVING:
+                    self.get_logger().info(f"★ 라바콘 {num_cones}개 감지 ➔ 문코스(CONE_DRIVING) 주행 시작")
+                return DriveState.CONE_DRIVING
             return DriveState.LANE_DRIVING
-
-        # 둘 다 조건이 해당하지 않을 경우 이전 주행 상태를 유지하거나 기본값 차선주행 적용
-        if self.current_drive_state in (DriveState.LANE_DRIVING, DriveState.CONE_DRIVING):
-            return self.current_drive_state
-        return DriveState.LANE_DRIVING
 
     #====================================================================
     # [Lap Counter]
@@ -384,8 +405,8 @@ class TrackDriverNode(Node):
                 # PID 제어 법칙
                 steer_cmd = self.prev_steer + (self.steer_kp * error) + (self.steer_ki * self.steer_integral) + (self.steer_kd * d_error)
                 
-                # 물리 범위 클램핑 적용 (Left max -100, Right max 42)
-                steer_cmd = max(-100.0, min(42.0, steer_cmd))
+                # 물리 범위 클램핑 적용 (Left max -100, Right max 100)
+                steer_cmd = max(-100.0, min(100.0, steer_cmd))
                 
                 self.prev_steer = steer_cmd
                 self.prev_steer_error = error

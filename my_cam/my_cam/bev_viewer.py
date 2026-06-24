@@ -115,10 +115,10 @@ class BEVViewerNode(Node):
 
         # 5. Lookahead Distance & 타겟 진행 방향 계산
         # track_drive.py 튜닝 스펙과 동일한 L_d 계산
-        lookahead_distance = max(0.4, min(1.3, 0.3 + 0.06 * self.current_speed))
+        lookahead_distance = max(0.5, min(1.8, 0.4 + 0.08 * self.current_speed))
         
-        # 거리를 픽셀 좌표(y)로 선형 변핑 (0.4m ~ 1.5m -> h ~ 0)
-        target_y = int(h - (lookahead_distance - 0.4) / (1.5 - 0.4) * h)
+        # 거리를 픽셀 좌표(y)로 선형 변핑 (0.5m ~ 1.8m -> h ~ 0)
+        target_y = int(h - (lookahead_distance - 0.5) / (1.8 - 0.5) * h)
         target_y = max(0, min(h - 1, target_y))
 
         # target_y에 해당하는 슬라이딩 윈도우 인덱스
