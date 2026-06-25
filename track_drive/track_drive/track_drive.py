@@ -62,7 +62,7 @@ class TrackDriverNode(Node):
         
         # 속도 기본값 설정 (동적 속도 제어 범위)
         self.speed_max = 10.0      # 직진 최고 속도
-        self.speed_min = 3.5       # 커브 최저 속도 (최근 피드백 반영)
+        self.speed_min = 2.0       # 커브 최저 속도 (급커브 안전 대응을 위해 대폭 하향)
         self.speed_stop = 0.0       # 정지 속도
         
         # 보행자 안전 대기 관련 변수
@@ -73,10 +73,10 @@ class TrackDriverNode(Node):
         self.start_time = time.time()
         self.last_lap_time = time.time()
 
-        # 조향 PID 필터 파라미터 및 상태 변수
-        self.steer_kp = 0.60
-        self.steer_kd = 0.15
-        self.steer_ki = 0.02
+        # 조향 PID 필터 파라미터 및 상태 변수 (연습주행 오실레이션 제어를 위해 미세 댐핑 조정)
+        self.steer_kp = 0.50
+        self.steer_kd = 0.10
+        self.steer_ki = 0.01
         self.prev_steer = 0.0
         self.prev_steer_error = 0.0
         self.steer_integral = 0.0
@@ -117,19 +117,14 @@ class TrackDriverNode(Node):
     # [Steering Controller]
     # Pure Pursuit 기하학적 제어기
     #====================================================================
-    def pure_pursuit_steering(self, steer_offset):
+    def pure_pursuit_steering(self, e_y, lookahead_distance):
         """
         Pure Pursuit 알고리즘을 사용하여 조향각을 계산합니다.
-        - steer_offset: 차선 중심 오프셋 (픽셀 단위)
+        - e_y: lookahead_distance 지점에서의 물리적 횡방향 오차 (meters)
+        - lookahead_distance: 전방주시거리 (meters)
         """
-        e_x = steer_offset / 0.4
-        speed = self.motor_msg.speed
-        
-        # 속도 기반 동적 전방주시거리(Lookahead Distance) 계산 (직진 및 코너링 동적 튜닝)
-        lookahead_distance = max(self.lookahead_min, min(self.lookahead_max, 0.4 + 0.08 * speed)) 
-        
-        # 퓨어퍼슛 조향각 계산 공식 (원근 투영 비례 축소 반영)
-        delta = math.atan2(2.0 * self.wheelbase * e_x, self.focal_length * lookahead_distance)
+        # 퓨어퍼슛 조향각 계산 공식 (kinematic bicycle model)
+        delta = math.atan2(2.0 * self.wheelbase * e_y, lookahead_distance ** 2)
         angle_deg = math.degrees(delta)
         
         # 조향 게인 반영 및 출력 범위 제한 (-100 ~ 100)
@@ -140,11 +135,12 @@ class TrackDriverNode(Node):
         """
         조향각의 절대값에 따라 차량 속도를 동적으로 매핑합니다.
         - 조향각이 0에 가까울수록 (직진): speed_max (10.0)
-        - 조향각이 100에 가까울수록 (코너): speed_min (3.5)
+        - 조향각이 100에 가까울수록 (코너): speed_min (2.0)
         """
+        # 급커브 시 속도를 더욱 조기에 확 낮추기 위해 비선형(Non-linear) 감속을 적용합니다.
         steer_ratio = min(1.0, abs(steer_cmd) / 100.0)
-        # 선형 감속 보간
-        return self.speed_max - steer_ratio * (self.speed_max - self.speed_min)
+        steer_ratio_curved = steer_ratio ** 1.5  # 1.5승을 취해 급커브 진입 초기에 더 민감하게 감속
+        return self.speed_max - steer_ratio_curved * (self.speed_max - self.speed_min)
 
     def _count_detected_cones(self):
         """
@@ -242,27 +238,17 @@ class TrackDriverNode(Node):
                 self.get_logger().info("★ 녹색 신호 감지! 주행을 시작합니다.")
                 self.start_time = time.time()
                 self.last_lap_time = time.time()
-                
-                # 시작 시 전방 라바콘 유무에 따라 라바콘/차선 주행 즉각 선택
-                num_cones = self._count_detected_cones()
-                self.detected_cones_count = num_cones
-                if num_cones >= 4:
-                    self.get_logger().info(f"★ 초기 주행 선택: 라바콘 {num_cones}개 감지 ➔ 문코스(CONE_DRIVING) 주행 시작")
-                    return DriveState.CONE_DRIVING
                 return DriveState.LANE_DRIVING
             return DriveState.WAIT_FOR_GREEN
 
-        # 3. 완주 체크 (3바퀴 완주 시 FINISHED로 전이)
+        # 3. 완주 체크 (연습 주행을 위해 무한 주행하도록 종료 전이 비활성화)
         self.check_lap_completion()
-        if self.lap_count >= self.total_laps:
-            self.get_logger().info("★★★ 3바퀴 완주 성공! 주행을 안전하게 종료합니다. ★★★")
-            return DriveState.FINISHED
 
         # 4. 보행자 감지 판단
         ped_info = self.obstacle_detector.detect_pedestrian(self.image, self.lidar_ranges)
 
-        # 주행 상태 중 보행자가 앞(CENTER)을 가로막으면 긴급정지 상태로 전환 (차선/라바콘 주행 공통 적용)
-        if self.current_drive_state in (DriveState.LANE_DRIVING, DriveState.CONE_DRIVING):
+        # 주행 상태 중 보행자가 앞(CENTER)을 가로막으면 긴급정지 상태로 전환
+        if self.current_drive_state == DriveState.LANE_DRIVING:
             if ped_info['pedestrian_detected'] and ped_info['should_stop'] and ped_info['pedestrian_direction'] == 'CENTER':
                 self.get_logger().warn("⚠ 전방 보행자 감지! 긴급 정지 상태로 전환합니다. -> PEDESTRIAN_STOP")
                 self.pedestrian_clear_time = time.time()
@@ -280,31 +266,10 @@ class TrackDriverNode(Node):
                 if elapsed < self.recovery_delay_sec:
                     return DriveState.PEDESTRIAN_STOP
                 self.get_logger().info(f"★ 보행자 이탈 및 안전 대기 시간({self.recovery_delay_sec}초) 경과 완료 ➔ 주행 복귀")
-
-        # 5. 라바콘(문코스)과 차선 주행의 분기 판단
-        num_cones = self._count_detected_cones()
-        self.detected_cones_count = num_cones
-
-        # 1초에 한 번씩 콘 개수 실시간 디버그 로그 출력
-        current_time = time.time()
-        if current_time - self.last_cone_log_time >= 1.0:
-            self.get_logger().info(f"[LIDAR DETECT] Cones counted in front: {num_cones}")
-            self.last_cone_log_time = current_time
-        
-        # 현재 FSM 상태에 기반한 세부 분기 전이 제어
-        if self.current_drive_state == DriveState.CONE_DRIVING:
-            # 전방 0.5m에 검은색 도로가 나타나고, 디텍된 콘이 2개 이하가 되면 라인 주행으로 이탈 방지 복귀
-            if num_cones <= 2 and self._is_road_in_front_0_5m():
-                self.get_logger().info("★ 검은색 도로 감지 및 콘 2개 이하 ➔ 차선(LANE_DRIVING) 주행으로 안정 복귀")
                 return DriveState.LANE_DRIVING
-            return DriveState.CONE_DRIVING
-        else:
-            # 차선 주행 상태에서는 콘이 4개 이상으로 증대되면 콘 회피 주행 진입
-            if num_cones >= 4:
-                if self.current_drive_state != DriveState.CONE_DRIVING:
-                    self.get_logger().info(f"★ 라바콘 {num_cones}개 감지 ➔ 문코스(CONE_DRIVING) 주행 시작")
-                return DriveState.CONE_DRIVING
-            return DriveState.LANE_DRIVING
+
+        # 5. 콘 주행 비활성화 ➔ 무조건 차선 주행 상태 유지
+        return DriveState.LANE_DRIVING
 
     #====================================================================
     # [Lap Counter]
@@ -366,8 +331,15 @@ class TrackDriverNode(Node):
                 speed_cmd = 0.0
 
             elif self.current_drive_state == DriveState.LANE_DRIVING:
-                steer_offset, debug_img = self.lane_detector.detect(self.image)
-                steer_cmd = self.pure_pursuit_steering(steer_offset)
+                # 속도 기반 동적 전방주시거리 계산 (오실레이션 감소를 위해 룩어헤드 하한선 상향 및 계수 조정)
+                lookahead_distance = max(self.lookahead_min, min(self.lookahead_max, 0.8 + 0.10 * self.motor_msg.speed))
+                
+                # BEV 상의 물리적 횡오차 e_y 계산
+                e_y, debug_img = self.lane_detector.detect(self.image, lookahead_distance)
+                
+                # Pure Pursuit 조향각 산출
+                steer_cmd = self.pure_pursuit_steering(e_y, lookahead_distance)
+                
                 # 조향각에 따른 동적 감속 매핑
                 speed_cmd = self._map_speed_by_steer(steer_cmd)
 
