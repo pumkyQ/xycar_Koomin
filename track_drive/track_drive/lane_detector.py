@@ -136,9 +136,10 @@ class LaneDetector:
 
         # 전방 도로 곡률(Curvature) 계산: 최상단, 최하단, 중간 영역 대표값의 선형 편차(2차 미분 유사) 계산
         # 단순 x축 편차만 계산하면 차량의 헤딩 오차(Heading Error)가 곡률로 잘못 인식되는 문제를 방지합니다.
-        top_x = np.mean([pts[0] for pts in center_pts[7:10]])
-        bottom_x = np.mean([pts[0] for pts in center_pts[0:3]])
-        mid_x = np.mean([pts[0] for pts in center_pts[4:7]])
+        # 최상단 윈도우(인덱스 9)는 이미지 상부 왜곡 및 노이즈가 극심하므로 제외하고 0~8번 윈도우로 계산 대역을 하향 안정화합니다.
+        top_x = np.mean([pts[0] for pts in center_pts[6:9]])   # 6, 7, 8번 윈도우 평균
+        bottom_x = np.mean([pts[0] for pts in center_pts[0:3]])# 0, 1, 2번 윈도우 평균
+        mid_x = np.mean([pts[0] for pts in center_pts[3:6]])   # 3, 4, 5번 윈도우 평균
         expected_mid_x = (top_x + bottom_x) / 2.0
         curvature = abs(mid_x - expected_mid_x)
 

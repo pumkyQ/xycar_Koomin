@@ -58,14 +58,14 @@ class TrackDriverNode(Node):
         self.focal_length = 350.0
         self.steer_gain = 4.0       # 최근 피드백 조향 감도(4.0) 적용
         self.is_curve_mode = False  # 직선/급커브 판정을 위한 상태 변수
-        self.curve_enter_threshold = 22.0 # 급커브 모드 진입 임계값 (기존 15.0에서 상향)
-        self.curve_exit_threshold = 10.0   # 급커브 모드 탈출 임계값 (기존 8.0에서 상향)
+        self.curve_enter_threshold = 25.0 # 급커브 모드 진입 임계값 (사용자 요청에 따라 25.0으로 튜닝)
+        self.curve_exit_threshold = 15.0  # 급커브 모드 탈출 임계값 (사용자 요청에 따라 15.0으로 튜닝)
         self.last_curve_time = 0.0        # 마지막으로 곡선(또는 탈출 기준 이상)이 감지된 시점
         self.curve_exit_delay = 0.8       # 곡선 탈출 지연 시간 (초 단위, 기본값 0.8초)
         self.filtered_curvature = 0.0     # 필터링된 곡률 상태값
-        self.curv_alpha = 0.15            # EMA 필터 계수 (낮을수록 부드럽고 지연 증가)
+        self.curv_alpha = 0.25            # EMA 필터 계수 (필터 지연 단축을 위해 0.15에서 0.25로 상향)
         self.lookahead_min = 0.5    # 최소 전방주시거리 (급커브 대응)
-        self.lookahead_max = 1.8    # 최대 전방주시거리 (직진 안정성 확보, 기존 1.3에서 상향)
+        self.lookahead_max = 1.5    # 최대 전방주시거리 (1.8에서 1.5로 하향하여 극최상단 왜곡 영역 배제 및 반응성 확보)
         
         # 속도 기본값 설정 (동적 속도 제어 범위)
         self.speed_max = 10.0      # 직진 최고 속도
@@ -297,15 +297,22 @@ class TrackDriverNode(Node):
                 self.last_lap_time = current_time
                 self.get_logger().info(f"★★★ Lap {self.lap_count} 완료! (소요 시간: {current_time - self.start_time:.1f}초) ★★★")
 
-    def _maybe_log_status(self, steer_cmd, speed_cmd):
+    def _maybe_log_status(self, steer_cmd, speed_cmd, raw_curvature=0.0):
         """
-        차량의 현재 주행 상태와 제어 토픽 값을 디버그 로깅합니다.
+        차량의 현재 주행 상태와 제어 토픽 값을 디버그 로깅합니다 (5Hz로 스로틀링).
         """
+        if not hasattr(self, '_log_counter'):
+            self._log_counter = 0
+        self._log_counter += 1
+        if self._log_counter % 10 != 0:
+            return
+
         self.get_logger().info(
             f"[FSM STATUS] State: {self.current_drive_state} | "
+            f"CurveMode: {self.is_curve_mode} | "
+            f"Curv(F/R): {self.filtered_curvature:.1f}/{raw_curvature:.1f} | "
             f"Steer: {steer_cmd:.1f} | Speed: {speed_cmd:.1f} | "
-            f"Laps: {self.lap_count}/{self.total_laps} | "
-            f"Cones: {self.detected_cones_count}"
+            f"Laps: {self.lap_count}/{self.total_laps}"
         )
 
     def main_loop(self):
@@ -335,6 +342,7 @@ class TrackDriverNode(Node):
             steer_cmd = 0.0
             speed_cmd = 0.0
             curvature = 0.0
+            raw_curvature = 0.0
             is_sharp_curve = False
 
             if self.current_drive_state == DriveState.WAIT_FOR_GREEN:
@@ -455,7 +463,7 @@ class TrackDriverNode(Node):
             self.drive(angle=steer_cmd, speed=speed_cmd)
 
             # 5. 실시간 주기 상태 모니터 로깅
-            self._maybe_log_status(steer_cmd, speed_cmd)
+            self._maybe_log_status(steer_cmd, speed_cmd, raw_curvature if raw_curvature is not None else 0.0)
 
             # 20ms 주기 (50Hz) 유지
             time.sleep(0.02)
