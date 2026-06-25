@@ -26,10 +26,10 @@ WHITE_H_MIN, WHITE_H_MAX = 0, 180
 WHITE_S_MIN, WHITE_S_MAX = 0, 40
 WHITE_V_MIN, WHITE_V_MAX = 150, 255
 
-# HSV 색공간 임계값 - 노란색 차선 (그림자 대응을 위해 V_MIN을 50으로 하향)
-YELLOW_H_MIN, YELLOW_H_MAX = 15, 30
-YELLOW_S_MIN, YELLOW_S_MAX = 50, 255
-YELLOW_V_MIN, YELLOW_V_MAX = 50, 255
+# HSV 색공간 임계값 - 노란색 차선 (그림자 대응을 위해 하한값 대폭 하향, 상한값 H_MAX 38로 확장)
+YELLOW_H_MIN, YELLOW_H_MAX = 10, 38
+YELLOW_S_MIN, YELLOW_S_MAX = 30, 255
+YELLOW_V_MIN, YELLOW_V_MAX = 30, 255
 
 class LaneDetector:
     """
@@ -88,8 +88,8 @@ class LaneDetector:
         white_mask = self._filter_white(hsv_bev)
         yellow_mask = self._filter_yellow(hsv_bev)
 
-        # 3. 초록색 잔디 마스크를 통해 잔디/나무 영역 차단 (차선은 검은 아스팔트 도로 위에만 존재하므로 초록색 영역을 제외)
-        lower_green = np.array([35, 40, 40])
+        # 3. 초록색 잔디 마스크 (Hue 하한선을 40으로 올려 노란색과의 간섭을 원천 차단)
+        lower_green = np.array([40, 30, 30])
         upper_green = np.array([90, 255, 255])
         grass_mask = cv2.inRange(hsv_bev, lower_green, upper_green)
         
@@ -100,27 +100,25 @@ class LaneDetector:
         
         # 도로 영역(초록색 잔디가 아닌 곳) 내부에서 검출된 차선 후보만 유효화
         white_mask = cv2.bitwise_and(white_mask, road_mask)
-        yellow_mask = cv2.bitwise_and(yellow_mask, road_mask)
+        # yellow_mask = cv2.bitwise_and(yellow_mask, road_mask)  # 노란색은 잔디와 겹치지 않으므로 도로 영역 마스킹 불필요
 
-        # 3.5 노란 중앙선 추가 검증: 실제 중앙선은 좌우 양측에 검은색 아스팔트가 있어야 합니다.
-        # 잔디 경계선(한쪽은 잔디, 한쪽은 아스팔트)이나 노이즈는 이 조건을 만족하지 못하므로 필터링합니다.
-        delta = 12
-        road_left = np.zeros_like(road_mask)
-        road_right = np.zeros_like(road_mask)
-        road_left[:, delta:] = road_mask[:, :-delta]
-        road_right[:, :-delta] = road_mask[:, delta:]
-        
-        valid_centerline_zone = cv2.bitwise_and(road_left, road_right)
-        yellow_mask = cv2.bitwise_and(yellow_mask, valid_centerline_zone)
+        # 3.5 노란 중앙선 추가 검증: (이 코드가 코너 부근에서 중앙선을 지워버리는 원인이 되므로 비활성화)
+        # delta = 12
+        # road_left = np.zeros_like(road_mask)
+        # road_right = np.zeros_like(road_mask)
+        # road_left[:, delta:] = road_mask[:, :-delta]
+        # road_right[:, :-delta] = road_mask[:, delta:]
+        # 
+        # valid_centerline_zone = cv2.bitwise_and(road_left, road_right)
+        # yellow_mask = cv2.bitwise_and(yellow_mask, valid_centerline_zone)
 
-        # 3.6 점선(Dashed Line) 특성 반영: 중앙선은 짧은 세그먼트(점선)이므로, 
-        # 세로로 너무 길게 연속된 컴포넌트(예: 잔디 경계선)는 가짜 차선으로 간주하여 필터링합니다.
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(yellow_mask)
-        for label in range(1, num_labels):
-            height = stats[label, cv2.CC_STAT_HEIGHT]
-            # 세로 길이가 150픽셀을 초과하는 큰 덩어리는 지워버립니다.
-            if height > 150:
-                yellow_mask[labels == label] = 0
+        # 3.6 점선(Dashed Line) 특성 반영: (이 코드가 코너 부근에서 중앙선이 길게 뭉쳤을 때 제거해 버리므로 비활성화)
+        # num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(yellow_mask)
+        # for label in range(1, num_labels):
+        #     height = stats[label, cv2.CC_STAT_HEIGHT]
+        #     # 세로 길이가 150픽셀을 초과하는 큰 덩어리는 지워버립니다.
+        #     if height > 150:
+        #         yellow_mask[labels == label] = 0
 
         # 모폴로지 연산
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
@@ -231,10 +229,18 @@ class LaneDetector:
             midpoint = w // 2
             
             if num_yellow > 50:
-                # 노란색 중앙선은 전체 가로 폭을 탐색하여 차량 이탈 시에도 감지
-                left_hist = np.sum(left_mask[h // 2:, :], axis=0)
-                if np.max(left_hist) > 10:
-                    left_base = np.argmax(left_hist)
+                # 노란색 중앙선도 우측 흰선처럼 이전 프레임 위치 기준 주변 ±150 픽셀 영역에서 추적하여 노이즈(예: 바닥 글씨 등) 회피
+                if self.prev_left_x == int(w * 0.2):
+                    search_end = midpoint - 20
+                    left_hist = np.sum(left_mask[h // 2:, :search_end], axis=0)
+                    if np.max(left_hist) > 10:
+                        left_base = np.argmax(left_hist)
+                else:
+                    l_min = max(0, self.prev_left_x - 150)
+                    l_max = min(w, self.prev_left_x + 150)
+                    left_hist = np.sum(left_mask[h // 2:, l_min:l_max], axis=0)
+                    if np.max(left_hist) > 10:
+                        left_base = np.argmax(left_hist) + l_min
                         
             if num_white > 50:
                 # 우측 흰색 실선은 이전 프레임 위치 기준 주변 ±150 픽셀 영역에서 추적 (좌측 흰선 오인 차단)

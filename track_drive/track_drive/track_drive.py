@@ -58,10 +58,12 @@ class TrackDriverNode(Node):
         self.focal_length = 350.0
         self.steer_gain = 4.0       # 최근 피드백 조향 감도(4.0) 적용
         self.is_curve_mode = False  # 직선/급커브 판정을 위한 상태 변수
-        self.curve_enter_threshold = 15.0 # 급커브 모드 진입 임계값 (픽셀)
-        self.curve_exit_threshold = 8.0   # 급커브 모드 탈출 임계값 (직선 회복 기준, 픽셀)
+        self.curve_enter_threshold = 22.0 # 급커브 모드 진입 임계값 (기존 15.0에서 상향)
+        self.curve_exit_threshold = 10.0   # 급커브 모드 탈출 임계값 (기존 8.0에서 상향)
         self.last_curve_time = 0.0        # 마지막으로 곡선(또는 탈출 기준 이상)이 감지된 시점
         self.curve_exit_delay = 0.8       # 곡선 탈출 지연 시간 (초 단위, 기본값 0.8초)
+        self.filtered_curvature = 0.0     # 필터링된 곡률 상태값
+        self.curv_alpha = 0.15            # EMA 필터 계수 (낮을수록 부드럽고 지연 증가)
         self.lookahead_min = 0.5    # 최소 전방주시거리 (급커브 대응)
         self.lookahead_max = 1.8    # 최대 전방주시거리 (직진 안정성 확보, 기존 1.3에서 상향)
         
@@ -344,7 +346,16 @@ class TrackDriverNode(Node):
                 lookahead_distance = max(self.lookahead_min, min(self.lookahead_max, 0.8 + 0.10 * self.motor_msg.speed))
                 
                 # BEV 상의 물리적 횡오차 e_y 및 전방 도로 곡률 계산
-                e_y, curvature, debug_img = self.lane_detector.detect(self.image, lookahead_distance)
+                e_y, raw_curvature, debug_img = self.lane_detector.detect(self.image, lookahead_distance)
+                
+                # 곡률 지수 이동 평균(EMA) 필터 적용 (노이즈 억제)
+                if raw_curvature is not None:
+                    self.filtered_curvature = self.curv_alpha * raw_curvature + (1.0 - self.curv_alpha) * self.filtered_curvature
+                else:
+                    self.filtered_curvature = 0.0
+                
+                # 이후 판정에는 필터링된 곡률 사용
+                curvature = self.filtered_curvature
                 
                 # Pure Pursuit 조향각 산출
                 steer_cmd = self.pure_pursuit_steering(e_y, lookahead_distance)
@@ -374,12 +385,12 @@ class TrackDriverNode(Node):
                     curvature_steer_equiv = curvature * 0.8 if curvature is not None else 0.0
                     speed_steer_metric = max(abs(steer_cmd), curvature_steer_equiv)
                     speed_cmd = self._map_speed_by_steer(speed_steer_metric)
-
+ 
                 # 차선 디버그 모니터 윈도우 갱신
                 if debug_img is not None:
                     cv2.putText(debug_img, f"Lap: {self.lap_count}/{self.total_laps}", (10, 20),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                    cv2.putText(debug_img, f"State: LANE | Curv: {curvature:.1f} ({'CURVE' if is_sharp_curve else 'STRAIGHT'})", (10, 40),
+                    cv2.putText(debug_img, f"State: LANE | Curv: {raw_curvature:.1f} (Filt: {curvature:.1f}) ({'CURVE' if is_sharp_curve else 'STRAIGHT'})", (10, 40),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                     cv2.imshow("Lane Detection Debug", debug_img)
                     cv2.waitKey(1)
@@ -462,19 +473,16 @@ def main(args=None):
             node.drive(angle=0, speed=0)
         except Exception:
             pass
-
         try:
             cv2.destroyAllWindows()
             for _ in range(5):
                 cv2.waitKey(1)
         except Exception:
             pass
-
         try:
             node.destroy_node()
         except Exception:
             pass
-
         try:
             rclpy.shutdown()
         except Exception:
