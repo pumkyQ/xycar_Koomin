@@ -58,8 +58,8 @@ class TrackDriverNode(Node):
         self.focal_length = 350.0
         self.steer_gain = 4.0       # 최근 피드백 조향 감도(4.0) 적용
         self.is_curve_mode = False  # 직선/급커브 판정을 위한 상태 변수
-        self.curve_enter_threshold = 25.0 # 급커브 모드 진입 임계값 (사용자 요청에 따라 25.0으로 튜닝)
-        self.curve_exit_threshold = 15.0  # 급커브 모드 탈출 임계값 (사용자 요청에 따라 15.0으로 튜닝)
+        self.curve_enter_threshold = 25.0 # 급커브 모드 진입 임계값 (사용자 요청에 따라 25.0으로 조절)
+        self.curve_exit_threshold = 16.0  # 급커브 모드 탈출 임계값 (사용자 요청에 따라 16.0으로 조절)
         self.last_curve_time = 0.0        # 마지막으로 곡선(또는 탈출 기준 이상)이 감지된 시점
         self.curve_exit_delay = 0.8       # 곡선 탈출 지연 시간 (초 단위, 기본값 0.8초)
         self.filtered_curvature = 0.0     # 필터링된 곡률 상태값
@@ -69,7 +69,7 @@ class TrackDriverNode(Node):
         
         # 속도 기본값 설정 (동적 속도 제어 범위)
         self.speed_max = 10.0      # 직진 최고 속도
-        self.speed_min = 3.0       # 커브 최저 속도 (사용자 피드백 3.0 적용)
+        self.speed_min = 4.0       # 커브 최저 속도 (사용자 요청에 따라 4.0으로 상향)
         self.speed_stop = 0.0       # 정지 속도
         
         # 보행자 안전 대기 관련 변수
@@ -441,18 +441,24 @@ class TrackDriverNode(Node):
                         self.last_curve_log_time = now
                 else:
                     target_steer = steer_cmd
-                    error = target_steer - self.prev_steer
-                    self.steer_integral = max(-50.0, min(50.0, self.steer_integral + error))
-                    d_error = error - self.prev_steer_error
                     
-                    # PID 제어 법칙
-                    steer_cmd = self.prev_steer + (self.steer_kp * error) + (self.steer_ki * self.steer_integral) + (self.steer_kd * d_error)
+                    # [Jejudol_ws 벤치마킹] 조향 털림(오실레이션) 방지를 위한 Slew Rate Limiter + EMA 로우패스 필터
+                    # 1. 프레임당 최대 각도 변화량 제한 (Slew Rate Limiter)
+                    max_steer_change = 25.0  # 1프레임(20ms) 당 최대 25도(전체 100 기준) 변화 허용
+                    steer_diff = target_steer - self.prev_steer
+                    steer_diff = max(-max_steer_change, min(max_steer_change, steer_diff))
+                    rate_limited_steer = self.prev_steer + steer_diff
                     
-                    # 물리 범위 클램핑 적용 (Left max -100, Right max 100)
+                    # 2. 미세 노이즈 제거를 위한 EMA 지수이동평균 필터 (Low-Pass Filter)
+                    steer_alpha = 0.60  # 새로운 제어 명령 반영 비중 (0.60 적용으로 부드러움과 신속성 동시 확보)
+                    steer_cmd = steer_alpha * rate_limited_steer + (1.0 - steer_alpha) * self.prev_steer
+                    
+                    # 물리 제어 한계 클램핑 (-100 ~ 100)
                     steer_cmd = max(-100.0, min(100.0, steer_cmd))
                     
                     self.prev_steer = steer_cmd
-                    self.prev_steer_error = error
+                    self.prev_steer_error = 0.0
+                    self.steer_integral = 0.0
             else:
                 # 대기 또는 정지 상태 등에서는 필터 상태 초기화
                 self.prev_steer = steer_cmd

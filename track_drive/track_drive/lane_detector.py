@@ -145,16 +145,14 @@ class LaneDetector:
 
         # 5. Lookahead 거리에 따른 target_y 좌표 매핑
         # 거리 범위 (0.5m ~ 1.8m) -> 이미지 행 (h ~ 0)
-        target_y = int(h - (lookahead_distance - 0.5) / (1.8 - 0.5) * h)
-        target_y = max(0, min(h - 1, target_y))
+        target_y = float(h - (lookahead_distance - 0.5) / (1.8 - 0.5) * h)
+        target_y = max(0.0, min(float(h - 1), target_y))
 
-        # target_y에 대응하는 슬라이딩 윈도우 인덱스 추출
-        window_h = h // NUM_WINDOWS
-        target_idx = int((h - target_y) / window_h)
-        target_idx = max(0, min(NUM_WINDOWS - 1, target_idx))
-
-        # 직선구간 안정성을 위해 단일 룩어헤드 지점을 목표 x좌표로 사용 (오실레이션 방지)
-        target_x = center_pts[target_idx][0]
+        # target_y에 대응하는 x좌표를 center_pts들로부터 선형 보간하여 연속적으로 산출 (이산 인덱스 점프에 의한 조향 오실레이션 원천 차단)
+        xs = [pts[0] for pts in center_pts]
+        ys = [pts[1] for pts in center_pts]
+        # ys는 큰 값(밑바닥)에서 작은 값(꼭대기) 순서이므로 오름차순으로 뒤집어서 보간 수행
+        target_x = np.interp(target_y, ys[::-1], xs[::-1])
 
         # 6. 이미지 중앙 대비 가로 픽셀 편차를 물리 거리(m)로 변환
         offset = target_x - (w // 2)
@@ -174,11 +172,11 @@ class LaneDetector:
 
         # BEV 디버그 이미지 상에 목표값 시각화
         # Lookahead 수평선 (주황색)
-        cv2.line(debug_bev, (0, target_y), (w, target_y), (0, 165, 255), 1, cv2.LINE_AA)
+        cv2.line(debug_bev, (0, int(target_y)), (w, int(target_y)), (0, 165, 255), 1, cv2.LINE_AA)
         # 타겟 목표점 (노란색 원)
-        cv2.circle(debug_bev, (target_x, target_y), 8, (0, 255, 255), -1)
+        cv2.circle(debug_bev, (int(target_x), int(target_y)), 8, (0, 255, 255), -1)
         # 차량 진행 방향 벡터 화살표 (보라색)
-        cv2.arrowedLine(debug_bev, (w // 2, h - 1), (target_x, target_y), (255, 0, 255), 3, tipLength=0.1)
+        cv2.arrowedLine(debug_bev, (w // 2, h - 1), (int(target_x), int(target_y)), (255, 0, 255), 3, tipLength=0.1)
 
         # 이진 마스크 컬러 채널 복제
         mask_bgr = cv2.cvtColor(combined_mask, cv2.COLOR_GRAY2BGR)
