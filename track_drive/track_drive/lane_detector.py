@@ -136,10 +136,13 @@ class LaneDetector:
             white_mask, yellow_mask, combined_mask, bev_img.copy()
         )
 
-        # 전방 도로 곡률(Curvature) 계산: 최상단 3개 윈도우 평균 위치와 최하단 3개 윈도우 평균 위치의 횡방향(x) 편차 계산
+        # 전방 도로 곡률(Curvature) 계산: 최상단, 최하단, 중간 영역 대표값의 선형 편차(2차 미분 유사) 계산
+        # 단순 x축 편차만 계산하면 차량의 헤딩 오차(Heading Error)가 곡률로 잘못 인식되는 문제를 방지합니다.
         top_x = np.mean([pts[0] for pts in center_pts[7:10]])
         bottom_x = np.mean([pts[0] for pts in center_pts[0:3]])
-        curvature = abs(top_x - bottom_x)
+        mid_x = np.mean([pts[0] for pts in center_pts[4:7]])
+        expected_mid_x = (top_x + bottom_x) / 2.0
+        curvature = abs(mid_x - expected_mid_x)
 
         # 5. Lookahead 거리에 따른 target_y 좌표 매핑
         # 거리 범위 (0.5m ~ 1.8m) -> 이미지 행 (h ~ 0)
@@ -151,12 +154,8 @@ class LaneDetector:
         target_idx = int((h - target_y) / window_h)
         target_idx = max(0, min(NUM_WINDOWS - 1, target_idx))
 
-        # 다점 주시(Multi-point preview) 제어를 적용하여 코너에서 더 급격하고 선제적으로 조향하도록 조절
-        # 동적 룩어헤드 지점(50%), 중간 윈도우(30%), 전방 원거리 윈도우(20%)를 혼합합니다.
-        x_lookahead = center_pts[target_idx][0]
-        x_mid = center_pts[5][0]
-        x_far = center_pts[8][0]
-        target_x = int(0.5 * x_lookahead + 0.3 * x_mid + 0.2 * x_far)
+        # 직선구간 안정성을 위해 단일 룩어헤드 지점을 목표 x좌표로 사용 (오실레이션 방지)
+        target_x = center_pts[target_idx][0]
 
         # 6. 이미지 중앙 대비 가로 픽셀 편차를 물리 거리(m)로 변환
         offset = target_x - (w // 2)

@@ -57,13 +57,17 @@ class TrackDriverNode(Node):
         self.wheelbase = 0.33
         self.focal_length = 350.0
         self.steer_gain = 4.0       # 최근 피드백 조향 감도(4.0) 적용
-        self.curve_threshold = 30.0 # 직선/급커브 판정을 위한 곡률 임계값 (픽셀)
+        self.is_curve_mode = False  # 직선/급커브 판정을 위한 상태 변수
+        self.curve_enter_threshold = 15.0 # 급커브 모드 진입 임계값 (픽셀)
+        self.curve_exit_threshold = 8.0   # 급커브 모드 탈출 임계값 (직선 회복 기준, 픽셀)
+        self.last_curve_time = 0.0        # 마지막으로 곡선(또는 탈출 기준 이상)이 감지된 시점
+        self.curve_exit_delay = 0.8       # 곡선 탈출 지연 시간 (초 단위, 기본값 0.8초)
         self.lookahead_min = 0.5    # 최소 전방주시거리 (급커브 대응)
         self.lookahead_max = 1.8    # 최대 전방주시거리 (직진 안정성 확보, 기존 1.3에서 상향)
         
         # 속도 기본값 설정 (동적 속도 제어 범위)
         self.speed_max = 10.0      # 직진 최고 속도
-        self.speed_min = 2.5       # 커브 최저 속도 (급커브 안전 대응을 위해 2.5로 상향 조정)
+        self.speed_min = 3.0       # 커브 최저 속도 (사용자 피드백 3.0 적용)
         self.speed_stop = 0.0       # 정지 속도
         
         # 보행자 안전 대기 관련 변수
@@ -322,6 +326,8 @@ class TrackDriverNode(Node):
             if prev_state != next_state:
                 self.current_drive_state = next_state
                 self.get_logger().info(f"[STATE-TRANSITION] {prev_state} -> {next_state}")
+                if next_state != DriveState.LANE_DRIVING:
+                    self.is_curve_mode = False
 
             # 2. 상태별 조향 및 속도 명령 산출 (제어부와 상태 전이부의 독립성 보장)
             steer_cmd = 0.0
@@ -343,16 +349,29 @@ class TrackDriverNode(Node):
                 # Pure Pursuit 조향각 산출
                 steer_cmd = self.pure_pursuit_steering(e_y, lookahead_distance)
                 
-                # 급커브 판정 (실제 곡선 유무 판단)
-                is_sharp_curve = (self.current_drive_state == DriveState.LANE_DRIVING and 
-                                  curvature is not None and curvature > self.curve_threshold)
+                # 곡률 변화에 따른 이중 임계값 Hysteresis 상태 천이 및 급커브 판정
+                if curvature is not None:
+                    if curvature > self.curve_enter_threshold:
+                        self.is_curve_mode = True
+                        self.last_curve_time = time.time()
+                    elif curvature > self.curve_exit_threshold:
+                        # 아직 완전히 직선이 아니거나 탈출 임계값 위에 있으면 타이머 갱신
+                        self.last_curve_time = time.time()
+                
+                # 곡선 모드 해제 조건: 곡률이 탈출 임계값 미만으로 떨어진 지 curve_exit_delay 초가 경과해야 함
+                if self.is_curve_mode:
+                    if curvature is not None and curvature < self.curve_exit_threshold:
+                        if time.time() - self.last_curve_time > self.curve_exit_delay:
+                            self.is_curve_mode = False
+                
+                is_sharp_curve = self.is_curve_mode
                 
                 if is_sharp_curve:
-                    # 급커브 구간: 감속하여 원심력을 줄임 (2.5m/s 고정)
+                    # 급커브 구간: 감속하여 원심력을 줄임 (3.0m/s 고정)
                     speed_cmd = self.speed_min
                 else:
                     # 직선 및 완만한 커브: 조향 기반 동적 감속
-                    curvature_steer_equiv = curvature * 0.8
+                    curvature_steer_equiv = curvature * 0.8 if curvature is not None else 0.0
                     speed_steer_metric = max(abs(steer_cmd), curvature_steer_equiv)
                     speed_cmd = self._map_speed_by_steer(speed_steer_metric)
 
