@@ -311,10 +311,27 @@ def main(args=None):
     except KeyboardInterrupt:
         node.get_logger().info("사용자 정지 요청(Ctrl+C)")
     finally:
-        node.drive(angle=0, speed=0)
-        cv2.destroyAllWindows()
-        node.destroy_node()
-        rclpy.shutdown()
+        try:
+            node.drive(angle=0, speed=0)
+        except Exception:
+            pass
+
+        try:
+            cv2.destroyAllWindows()
+            for _ in range(5):
+                cv2.waitKey(1)
+        except Exception:
+            pass
+
+        try:
+            node.destroy_node()
+        except Exception:
+            pass
+
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
 
 if __name__ == '__main__':
     main()

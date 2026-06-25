@@ -26,20 +26,20 @@ WHITE_H_MIN, WHITE_H_MAX = 0, 180
 WHITE_S_MIN, WHITE_S_MAX = 0, 40
 WHITE_V_MIN, WHITE_V_MAX = 150, 255
 
-# HSV 색공간 임계값 - 노란색 차선 (녹색 잔디와의 혼선 방지를 위해 H_MAX를 30으로 조정)
+# HSV 색공간 임계값 - 노란색 차선 (그림자 대응을 위해 V_MIN을 50으로 하향)
 YELLOW_H_MIN, YELLOW_H_MAX = 15, 30
 YELLOW_S_MIN, YELLOW_S_MAX = 50, 255
-YELLOW_V_MIN, YELLOW_V_MAX = 80, 255
+YELLOW_V_MIN, YELLOW_V_MAX = 50, 255
 
 class LaneDetector:
     """
     카메라 영상을 BEV로 변환한 뒤, 동적 전방주시거리의 물리적 오차를 반환합니다.
     """
     def __init__(self):
-        # BEV 변환 소스 점(Trapezoid) 정의
+        # BEV 변환 소스 점(Trapezoid) 정의 (코너링 시 우측 흰선 화면 밖 이탈 방지를 위해 상단 가로 폭 확장)
         self.src_pts = np.float32([
-            [IMG_WIDTH * 0.25, IMG_HEIGHT * 0.55],  # 좌상단
-            [IMG_WIDTH * 0.75, IMG_HEIGHT * 0.55],  # 우상단
+            [IMG_WIDTH * 0.15, IMG_HEIGHT * 0.55],  # 좌상단 (기존 0.25에서 0.15로 확장)
+            [IMG_WIDTH * 0.85, IMG_HEIGHT * 0.55],  # 우상단 (기존 0.75에서 0.85로 확장)
             [IMG_WIDTH * 0.05, IMG_HEIGHT * 0.95],  # 좌하단
             [IMG_WIDTH * 0.95, IMG_HEIGHT * 0.95]   # 우하단
         ])
@@ -67,8 +67,8 @@ class LaneDetector:
         # 차선 검출 실패 카운터
         self.no_lane_count = 0
         
-        # BEV 상의 차선간 거리 초기값 (동적 추적 학습용, 1개 차로폭 기준인 180 적용)
-        self.lane_width_bev = 180
+        # 각 윈도우(0~9)별 예상 차선폭 초기값 (바닥은 180, 꼭대기는 80으로 원근 수렴하는 구조)
+        self.lane_widths = [int(180 - (180 - 80) * (i / (NUM_WINDOWS - 1))) for i in range(NUM_WINDOWS)]
 
     def detect(self, image, lookahead_distance=1.2):
         """
@@ -151,8 +151,12 @@ class LaneDetector:
         target_idx = int((h - target_y) / window_h)
         target_idx = max(0, min(NUM_WINDOWS - 1, target_idx))
 
-        # 해당 윈도우의 차선 중심 x좌표 선택
-        target_x = center_pts[target_idx][0]
+        # 다점 주시(Multi-point preview) 제어를 적용하여 코너에서 더 급격하고 선제적으로 조향하도록 조절
+        # 동적 룩어헤드 지점(50%), 중간 윈도우(30%), 전방 원거리 윈도우(20%)를 혼합합니다.
+        x_lookahead = center_pts[target_idx][0]
+        x_mid = center_pts[5][0]
+        x_far = center_pts[8][0]
+        target_x = int(0.5 * x_lookahead + 0.3 * x_mid + 0.2 * x_far)
 
         # 6. 이미지 중앙 대비 가로 픽셀 편차를 물리 거리(m)로 변환
         offset = target_x - (w // 2)
@@ -275,8 +279,8 @@ class LaneDetector:
             y_high = h - i * window_h
             y_center = (y_low + y_high) // 2
 
-            # 원근 수렴으로 인해 위로 갈수록 좁아지는 윈도우별 예상 차선폭 계산 (y=480에서 180px, y=0에서 80px)
-            lane_width_i = int(180 - (180 - 80) * (i / (NUM_WINDOWS - 1)))
+            # 해당 윈도우(i)의 동적으로 학습된 예상 차선폭 가져오기
+            lane_width_i = self.lane_widths[i]
 
             # 음수 슬라이싱 방지를 위한 클리핑 적용 (안전한 인덱스 바운딩)
             win_xl_low = max(0, min(w, left_current - WINDOW_MARGIN))
@@ -305,6 +309,8 @@ class LaneDetector:
                 if abs(measured_width - lane_width_i) < 40:
                     left_current = cand_left
                     right_current = cand_right
+                    # 해당 윈도우 높이의 학습된 차선폭을 부드럽게 업데이트 (곡선 주행 시 원근 투영폭 변화 대응)
+                    self.lane_widths[i] = int(0.95 * self.lane_widths[i] + 0.05 * measured_width)
                 else:
                     # 차선폭이 비정상인 경우, 이전 윈도우 위치로부터의 변화량이 적은 쪽을 신뢰
                     prev_l = left_pts[-1][0] if len(left_pts) > 0 else left_base
@@ -325,8 +331,20 @@ class LaneDetector:
             elif right_detected:
                 right_current = int(win_xr_low + np.mean(np.where(right_area > 0)[1]))
                 left_current = right_current - lane_width_i
-            # 둘 다 감지 안 되면 이전 윈도우 값을 전파
-
+            # 둘 다 감지 안 되면 이전 윈도우의 곡률 트렌드(gradient)를 반영하여 연장 (직진 및 곡선 유지)
+            if not left_detected and not right_detected:
+                shift_l = 0
+                shift_r = 0
+                if len(left_pts) >= 2:
+                    shift_l = left_pts[-1][0] - left_pts[-2][0]
+                    shift_l = max(-15, min(15, shift_l))
+                if len(right_pts) >= 2:
+                    shift_r = right_pts[-1][0] - right_pts[-2][0]
+                    shift_r = max(-15, min(15, shift_r))
+                
+                left_current = left_current + shift_l
+                right_current = right_current + shift_r
+            
             left_pts.append((left_current, y_center))
             right_pts.append((right_current, y_center))
             
