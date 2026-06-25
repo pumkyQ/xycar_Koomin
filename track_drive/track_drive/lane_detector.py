@@ -232,18 +232,25 @@ class LaneDetector:
             midpoint = w // 2
             
             if num_yellow > 50:
-                # 노란색 중앙선은 왼쪽에서 중앙 약간 우측(midpoint + 60)까지만 탐색
-                search_limit_left = midpoint + 60
-                left_hist = np.sum(left_mask[h // 2:, :search_limit_left], axis=0)
+                # 노란색 중앙선은 전체 가로 폭을 탐색하여 차량 이탈 시에도 감지
+                left_hist = np.sum(left_mask[h // 2:, :], axis=0)
                 if np.max(left_hist) > 10:
                     left_base = np.argmax(left_hist)
                         
             if num_white > 50:
-                # 우측 흰색 실선은 우측에서 중앙 약간 좌측(midpoint - 60)부터만 탐색 (좌측 흰선 오인 차단)
-                search_limit_right = midpoint - 60
-                right_hist = np.sum(right_mask[h // 2:, search_limit_right:], axis=0)
-                if np.max(right_hist) > 10:
-                    right_base = np.argmax(right_hist) + search_limit_right
+                # 우측 흰색 실선은 이전 프레임 위치 기준 주변 ±150 픽셀 영역에서 추적 (좌측 흰선 오인 차단)
+                # 초기 프레임(또는 이전 정보가 기본값일 때)에는 중앙 영역부터 오른쪽 끝까지 검색
+                if self.prev_right_x == int(w * 0.8):
+                    search_start = midpoint - 40
+                    right_hist = np.sum(right_mask[h // 2:, search_start:], axis=0)
+                    if np.max(right_hist) > 10:
+                        right_base = np.argmax(right_hist) + search_start
+                else:
+                    r_min = max(0, self.prev_right_x - 150)
+                    r_max = min(w, self.prev_right_x + 150)
+                    right_hist = np.sum(right_mask[h // 2:, r_min:r_max], axis=0)
+                    if np.max(right_hist) > 10:
+                        right_base = np.argmax(right_hist) + r_min
         else:
             # 올화이트 차선 또는 노란색/흰색 모두 검출 안됨
             left_mask = combined_mask

@@ -57,6 +57,7 @@ class TrackDriverNode(Node):
         self.wheelbase = 0.33
         self.focal_length = 350.0
         self.steer_gain = 4.0       # 최근 피드백 조향 감도(4.0) 적용
+        self.curve_threshold = 30.0 # 직선/급커브 판정을 위한 곡률 임계값 (픽셀)
         self.lookahead_min = 0.5    # 최소 전방주시거리 (급커브 대응)
         self.lookahead_max = 1.8    # 최대 전방주시거리 (직진 안정성 확보, 기존 1.3에서 상향)
         
@@ -325,6 +326,7 @@ class TrackDriverNode(Node):
             # 2. 상태별 조향 및 속도 명령 산출 (제어부와 상태 전이부의 독립성 보장)
             steer_cmd = 0.0
             speed_cmd = 0.0
+            curvature = 0.0
 
             if self.current_drive_state == DriveState.WAIT_FOR_GREEN:
                 steer_cmd = 0.0
@@ -373,19 +375,43 @@ class TrackDriverNode(Node):
 
             # 3. 조향 PID 필터 적용 (LANE_DRIVING 및 CONE_DRIVING 상태에서만 동작)
             if self.current_drive_state in (DriveState.LANE_DRIVING, DriveState.CONE_DRIVING):
-                target_steer = steer_cmd
-                error = target_steer - self.prev_steer
-                self.steer_integral = max(-50.0, min(50.0, self.steer_integral + error))
-                d_error = error - self.prev_steer_error
+                # 급커브 판정 (LANE_DRIVING 상태이고 곡률이 임계값 이상일 때)
+                is_sharp_curve = (self.current_drive_state == DriveState.LANE_DRIVING and 
+                                  curvature is not None and curvature > self.curve_threshold)
                 
-                # PID 제어 법칙
-                steer_cmd = self.prev_steer + (self.steer_kp * error) + (self.steer_ki * self.steer_integral) + (self.steer_kd * d_error)
-                
-                # 물리 범위 클램핑 적용 (Left max -100, Right max 100)
-                steer_cmd = max(-100.0, min(100.0, steer_cmd))
-                
-                self.prev_steer = steer_cmd
-                self.prev_steer_error = error
+                if is_sharp_curve:
+                    # 조향 방향 판단 (steer_cmd의 부호에 따름)
+                    if steer_cmd > 0:
+                        steer_cmd = 100.0
+                    elif steer_cmd < 0:
+                        steer_cmd = -100.0
+                    
+                    # 급커브 시 PID 필터를 우회하여 모터가 즉시 최대 각도로 회전
+                    self.prev_steer = steer_cmd
+                    self.prev_steer_error = 0.0
+                    self.steer_integral = 0.0
+                    
+                    # 급커브 로그 쓰로틀링 (1초 간격)
+                    now = time.time()
+                    if not hasattr(self, 'last_curve_log_time'):
+                        self.last_curve_log_time = 0.0
+                    if now - self.last_curve_log_time > 1.0:
+                        self.get_logger().info(f"[SHARP CURVE] Curvature: {curvature:.1f} | Force Max Steer: {steer_cmd:.1f}")
+                        self.last_curve_log_time = now
+                else:
+                    target_steer = steer_cmd
+                    error = target_steer - self.prev_steer
+                    self.steer_integral = max(-50.0, min(50.0, self.steer_integral + error))
+                    d_error = error - self.prev_steer_error
+                    
+                    # PID 제어 법칙
+                    steer_cmd = self.prev_steer + (self.steer_kp * error) + (self.steer_ki * self.steer_integral) + (self.steer_kd * d_error)
+                    
+                    # 물리 범위 클램핑 적용 (Left max -100, Right max 100)
+                    steer_cmd = max(-100.0, min(100.0, steer_cmd))
+                    
+                    self.prev_steer = steer_cmd
+                    self.prev_steer_error = error
             else:
                 # 대기 또는 정지 상태 등에서는 필터 상태 초기화
                 self.prev_steer = steer_cmd
