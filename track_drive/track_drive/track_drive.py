@@ -63,7 +63,7 @@ class TrackDriverNode(Node):
         
         # 속도 기본값 설정 (동적 속도 제어 범위)
         self.speed_max = 10.0      # 직진 최고 속도
-        self.speed_min = 2.0       # 커브 최저 속도 (급커브 안전 대응을 위해 대폭 하향)
+        self.speed_min = 2.5       # 커브 최저 속도 (급커브 안전 대응을 위해 2.5로 상향 조정)
         self.speed_stop = 0.0       # 정지 속도
         
         # 보행자 안전 대기 관련 변수
@@ -327,6 +327,7 @@ class TrackDriverNode(Node):
             steer_cmd = 0.0
             speed_cmd = 0.0
             curvature = 0.0
+            is_sharp_curve = False
 
             if self.current_drive_state == DriveState.WAIT_FOR_GREEN:
                 steer_cmd = 0.0
@@ -342,18 +343,24 @@ class TrackDriverNode(Node):
                 # Pure Pursuit 조향각 산출
                 steer_cmd = self.pure_pursuit_steering(e_y, lookahead_distance)
                 
-                # 전방 도로 곡률(픽셀 단위 편차)을 조향각 스케일과 매칭되도록 변환 (예: 100픽셀 편차 -> 80도 상당 조향 효과)
-                curvature_steer_equiv = curvature * 0.8
+                # 급커브 판정 (실제 곡선 유무 판단)
+                is_sharp_curve = (self.current_drive_state == DriveState.LANE_DRIVING and 
+                                  curvature is not None and curvature > self.curve_threshold)
                 
-                # 현재 조향각과 전방 곡률 중 최댓값을 기준으로 속도 조절 (코너 진입 전 선제 감속 효과)
-                speed_steer_metric = max(abs(steer_cmd), curvature_steer_equiv)
-                speed_cmd = self._map_speed_by_steer(speed_steer_metric)
+                if is_sharp_curve:
+                    # 급커브 구간: 감속하여 원심력을 줄임 (2.5m/s 고정)
+                    speed_cmd = self.speed_min
+                else:
+                    # 직선 및 완만한 커브: 조향 기반 동적 감속
+                    curvature_steer_equiv = curvature * 0.8
+                    speed_steer_metric = max(abs(steer_cmd), curvature_steer_equiv)
+                    speed_cmd = self._map_speed_by_steer(speed_steer_metric)
 
                 # 차선 디버그 모니터 윈도우 갱신
                 if debug_img is not None:
                     cv2.putText(debug_img, f"Lap: {self.lap_count}/{self.total_laps}", (10, 20),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                    cv2.putText(debug_img, f"State: LANE | Curv: {curvature:.1f} ({curvature_steer_equiv:.1f})", (10, 40),
+                    cv2.putText(debug_img, f"State: LANE | Curv: {curvature:.1f} ({'CURVE' if is_sharp_curve else 'STRAIGHT'})", (10, 40),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                     cv2.imshow("Lane Detection Debug", debug_img)
                     cv2.waitKey(1)
@@ -375,10 +382,6 @@ class TrackDriverNode(Node):
 
             # 3. 조향 PID 필터 적용 (LANE_DRIVING 및 CONE_DRIVING 상태에서만 동작)
             if self.current_drive_state in (DriveState.LANE_DRIVING, DriveState.CONE_DRIVING):
-                # 급커브 판정 (LANE_DRIVING 상태이고 곡률이 임계값 이상일 때)
-                is_sharp_curve = (self.current_drive_state == DriveState.LANE_DRIVING and 
-                                  curvature is not None and curvature > self.curve_threshold)
-                
                 if is_sharp_curve:
                     # 조향 방향 판단 (steer_cmd의 부호에 따름)
                     if steer_cmd > 0:
@@ -396,7 +399,7 @@ class TrackDriverNode(Node):
                     if not hasattr(self, 'last_curve_log_time'):
                         self.last_curve_log_time = 0.0
                     if now - self.last_curve_log_time > 1.0:
-                        self.get_logger().info(f"[SHARP CURVE] Curvature: {curvature:.1f} | Force Max Steer: {steer_cmd:.1f}")
+                        self.get_logger().info(f"[SHARP CURVE] Curvature: {curvature:.1f} | Force Max Steer: {steer_cmd:.1f} | Speed Decel: {speed_cmd:.1f}")
                         self.last_curve_log_time = now
                 else:
                     target_steer = steer_cmd
