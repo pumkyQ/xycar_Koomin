@@ -334,20 +334,24 @@ class TrackDriverNode(Node):
                 # 속도 기반 동적 전방주시거리 계산 (오실레이션 감소를 위해 룩어헤드 하한선 상향 및 계수 조정)
                 lookahead_distance = max(self.lookahead_min, min(self.lookahead_max, 0.8 + 0.10 * self.motor_msg.speed))
                 
-                # BEV 상의 물리적 횡오차 e_y 계산
-                e_y, debug_img = self.lane_detector.detect(self.image, lookahead_distance)
+                # BEV 상의 물리적 횡오차 e_y 및 전방 도로 곡률 계산
+                e_y, curvature, debug_img = self.lane_detector.detect(self.image, lookahead_distance)
                 
                 # Pure Pursuit 조향각 산출
                 steer_cmd = self.pure_pursuit_steering(e_y, lookahead_distance)
                 
-                # 조향각에 따른 동적 감속 매핑
-                speed_cmd = self._map_speed_by_steer(steer_cmd)
+                # 전방 도로 곡률(픽셀 단위 편차)을 조향각 스케일과 매칭되도록 변환 (예: 100픽셀 편차 -> 80도 상당 조향 효과)
+                curvature_steer_equiv = curvature * 0.8
+                
+                # 현재 조향각과 전방 곡률 중 최댓값을 기준으로 속도 조절 (코너 진입 전 선제 감속 효과)
+                speed_steer_metric = max(abs(steer_cmd), curvature_steer_equiv)
+                speed_cmd = self._map_speed_by_steer(speed_steer_metric)
 
                 # 차선 디버그 모니터 윈도우 갱신
                 if debug_img is not None:
                     cv2.putText(debug_img, f"Lap: {self.lap_count}/{self.total_laps}", (10, 20),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                    cv2.putText(debug_img, f"State: LANE | Control: PURE_PURSUIT", (10, 40),
+                    cv2.putText(debug_img, f"State: LANE | Curv: {curvature:.1f} ({curvature_steer_equiv:.1f})", (10, 40),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                     cv2.imshow("Lane Detection Debug", debug_img)
                     cv2.waitKey(1)

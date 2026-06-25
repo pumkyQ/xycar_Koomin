@@ -249,7 +249,7 @@ class TrackDriverNode(Node):
         """
         차선 인식 모듈을 통해 계산된 steer_offset을 조향에 반영하여 차선 주행을 수행합니다.
         """
-        steer_offset, debug_img = self.lane_detector.detect(self.image)
+        steer_offset, _, debug_img = self.lane_detector.detect(self.image)
         
         # 선택된 제어 알고리즘 적용
         if self.control_method == "PURE_PURSUIT":

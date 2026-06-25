@@ -26,8 +26,8 @@ WHITE_H_MIN, WHITE_H_MAX = 0, 180
 WHITE_S_MIN, WHITE_S_MAX = 0, 40
 WHITE_V_MIN, WHITE_V_MAX = 150, 255
 
-# HSV 색공간 임계값 - 노란색 차선
-YELLOW_H_MIN, YELLOW_H_MAX = 15, 35
+# HSV 색공간 임계값 - 노란색 차선 (녹색 잔디와의 혼선 방지를 위해 H_MAX를 30으로 조정)
+YELLOW_H_MIN, YELLOW_H_MAX = 15, 30
 YELLOW_S_MIN, YELLOW_S_MAX = 50, 255
 YELLOW_V_MIN, YELLOW_V_MAX = 80, 255
 
@@ -67,15 +67,16 @@ class LaneDetector:
         # 차선 검출 실패 카운터
         self.no_lane_count = 0
         
-        # BEV 상의 차선간 거리 초기값 (동적 추적 학습용, 초기값 240)
-        self.lane_width_bev = 240
+        # BEV 상의 차선간 거리 초기값 (동적 추적 학습용, 1개 차로폭 기준인 180 적용)
+        self.lane_width_bev = 180
 
-    def detect(self, image, lookahead_distance):
+    def detect(self, image, lookahead_distance=1.2):
         """
-        카메라 영상을 BEV로 변환하여 동적 Lookahead 거리에서의 물리적 오프셋 e_y(m)를 반환합니다.
+        카메라 영상을 BEV로 변환하여 동적 Lookahead 거리에서의 물리적 오프셋 e_y(m)와 
+        전방 도로 곡률(curvature)을 반환합니다.
         """
         if image is None:
-            return 0.0, None
+            return 0.0, 0.0, None
 
         h, w = image.shape[:2]
 
@@ -87,18 +88,39 @@ class LaneDetector:
         white_mask = self._filter_white(hsv_bev)
         yellow_mask = self._filter_yellow(hsv_bev)
 
-        # 3. 어두운 도로 검은색 마스크를 통한 잔디/나무 노이즈 차단 (그림자 포함하도록 구간 대폭 확장)
-        lower_road = np.array([0, 0, 10])
-        upper_road = np.array([180, 80, 200])
-        road_mask = cv2.inRange(hsv_bev, lower_road, upper_road)
+        # 3. 초록색 잔디 마스크를 통해 잔디/나무 영역 차단 (차선은 검은 아스팔트 도로 위에만 존재하므로 초록색 영역을 제외)
+        lower_green = np.array([35, 40, 40])
+        upper_green = np.array([90, 255, 255])
+        grass_mask = cv2.inRange(hsv_bev, lower_green, upper_green)
         
-        # 도로 마스크 팽창
-        kernel_dilate = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25))
-        dilated_road_mask = cv2.dilate(road_mask, kernel_dilate, iterations=1)
+        # 잔디 마스크를 팽창시켜 도로 경계면의 혼색 노이즈까지 확실하게 차단합니다.
+        kernel_dilate = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        dilated_grass_mask = cv2.dilate(grass_mask, kernel_dilate, iterations=1)
+        road_mask = cv2.bitwise_not(dilated_grass_mask)
         
-        # 도로 영역 내부에서 검출된 차선 후보만 유효화
-        white_mask = cv2.bitwise_and(white_mask, dilated_road_mask)
-        yellow_mask = cv2.bitwise_and(yellow_mask, dilated_road_mask)
+        # 도로 영역(초록색 잔디가 아닌 곳) 내부에서 검출된 차선 후보만 유효화
+        white_mask = cv2.bitwise_and(white_mask, road_mask)
+        yellow_mask = cv2.bitwise_and(yellow_mask, road_mask)
+
+        # 3.5 노란 중앙선 추가 검증: 실제 중앙선은 좌우 양측에 검은색 아스팔트가 있어야 합니다.
+        # 잔디 경계선(한쪽은 잔디, 한쪽은 아스팔트)이나 노이즈는 이 조건을 만족하지 못하므로 필터링합니다.
+        delta = 12
+        road_left = np.zeros_like(road_mask)
+        road_right = np.zeros_like(road_mask)
+        road_left[:, delta:] = road_mask[:, :-delta]
+        road_right[:, :-delta] = road_mask[:, delta:]
+        
+        valid_centerline_zone = cv2.bitwise_and(road_left, road_right)
+        yellow_mask = cv2.bitwise_and(yellow_mask, valid_centerline_zone)
+
+        # 3.6 점선(Dashed Line) 특성 반영: 중앙선은 짧은 세그먼트(점선)이므로, 
+        # 세로로 너무 길게 연속된 컴포넌트(예: 잔디 경계선)는 가짜 차선으로 간주하여 필터링합니다.
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(yellow_mask)
+        for label in range(1, num_labels):
+            height = stats[label, cv2.CC_STAT_HEIGHT]
+            # 세로 길이가 150픽셀을 초과하는 큰 덩어리는 지워버립니다.
+            if height > 150:
+                yellow_mask[labels == label] = 0
 
         # 모폴로지 연산
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
@@ -113,6 +135,11 @@ class LaneDetector:
         left_pts, right_pts, center_pts, debug_bev = self._sliding_window_bev(
             white_mask, yellow_mask, combined_mask, bev_img.copy()
         )
+
+        # 전방 도로 곡률(Curvature) 계산: 최상단 3개 윈도우 평균 위치와 최하단 3개 윈도우 평균 위치의 횡방향(x) 편차 계산
+        top_x = np.mean([pts[0] for pts in center_pts[7:10]])
+        bottom_x = np.mean([pts[0] for pts in center_pts[0:3]])
+        curvature = abs(top_x - bottom_x)
 
         # 5. Lookahead 거리에 따른 target_y 좌표 매핑
         # 거리 범위 (0.5m ~ 1.8m) -> 이미지 행 (h ~ 0)
@@ -167,7 +194,7 @@ class LaneDetector:
         display_h = int(h * 0.7)
         debug_img = cv2.resize(combined, (display_w, display_h))
 
-        return e_y, debug_img
+        return e_y, curvature, debug_img
 
     def _filter_white(self, hsv):
         """HSV 색공간에서 흰색 차선 후보 마스크를 반환합니다."""
@@ -198,16 +225,21 @@ class LaneDetector:
             
             left_base = self.prev_left_x
             right_base = self.prev_right_x
+            midpoint = w // 2
             
             if num_yellow > 50:
-                left_hist = np.sum(left_mask[h // 2:, :], axis=0)
+                # 노란색 중앙선은 왼쪽에서 중앙 약간 우측(midpoint + 60)까지만 탐색
+                search_limit_left = midpoint + 60
+                left_hist = np.sum(left_mask[h // 2:, :search_limit_left], axis=0)
                 if np.max(left_hist) > 10:
                     left_base = np.argmax(left_hist)
                         
             if num_white > 50:
-                right_hist = np.sum(right_mask[h // 2:, :], axis=0)
+                # 우측 흰색 실선은 우측에서 중앙 약간 좌측(midpoint - 60)부터만 탐색 (좌측 흰선 오인 차단)
+                search_limit_right = midpoint - 60
+                right_hist = np.sum(right_mask[h // 2:, search_limit_right:], axis=0)
                 if np.max(right_hist) > 10:
-                    right_base = np.argmax(right_hist)
+                    right_base = np.argmax(right_hist) + search_limit_right
         else:
             # 올화이트 차선 또는 노란색/흰색 모두 검출 안됨
             left_mask = combined_mask
@@ -237,12 +269,14 @@ class LaneDetector:
         center_pts = []
 
         window_h = h // NUM_WINDOWS
-        lane_width_bev = self.lane_width_bev
 
         for i in range(NUM_WINDOWS):
             y_low = h - (i + 1) * window_h
             y_high = h - i * window_h
             y_center = (y_low + y_high) // 2
+
+            # 원근 수렴으로 인해 위로 갈수록 좁아지는 윈도우별 예상 차선폭 계산 (y=480에서 180px, y=0에서 80px)
+            lane_width_i = int(180 - (180 - 80) * (i / (NUM_WINDOWS - 1)))
 
             # 음수 슬라이싱 방지를 위한 클리핑 적용 (안전한 인덱스 바운딩)
             win_xl_low = max(0, min(w, left_current - WINDOW_MARGIN))
@@ -267,15 +301,12 @@ class LaneDetector:
                 
                 # 검출된 차선폭 검증
                 measured_width = cand_right - cand_left
-                # 예상 차선폭 범위 내인 경우에만 둘 다 인정
-                if abs(measured_width - lane_width_bev) < 60:
+                # 해당 높이의 예상 차선폭 범위 내인 경우에만 둘 다 인정 (기준 오차 40px 허용)
+                if abs(measured_width - lane_width_i) < 40:
                     left_current = cand_left
                     right_current = cand_right
-                    # 차선폭 동적 업데이트
-                    self.lane_width_bev = int(0.9 * self.lane_width_bev + 0.1 * measured_width)
-                    lane_width_bev = self.lane_width_bev
                 else:
-                    # 차선폭이 비정상인 경우, 이전 윈도우(바로 아래 윈도우) 위치로부터의 변화량이 적은 쪽을 신뢰
+                    # 차선폭이 비정상인 경우, 이전 윈도우 위치로부터의 변화량이 적은 쪽을 신뢰
                     prev_l = left_pts[-1][0] if len(left_pts) > 0 else left_base
                     prev_r = right_pts[-1][0] if len(right_pts) > 0 else right_base
                     
@@ -284,20 +315,16 @@ class LaneDetector:
                     
                     if shift_l <= shift_r:
                         left_current = cand_left
-                        # 우측 차선은 학습된 가로폭으로 복원
-                        right_current = left_current + lane_width_bev
+                        right_current = left_current + lane_width_i
                     else:
                         right_current = cand_right
-                        # 좌측 차선은 학습된 가로폭으로 복원
-                        left_current = right_current - lane_width_bev
+                        left_current = right_current - lane_width_i
             elif left_detected:
                 left_current = int(win_xl_low + np.mean(np.where(left_area > 0)[1]))
-                # 우측 차선은 학습된 가로폭으로 복원
-                right_current = left_current + lane_width_bev
+                right_current = left_current + lane_width_i
             elif right_detected:
                 right_current = int(win_xr_low + np.mean(np.where(right_area > 0)[1]))
-                # 좌측 차선은 학습된 가로폭으로 복원
-                left_current = right_current - lane_width_bev
+                left_current = right_current - lane_width_i
             # 둘 다 감지 안 되면 이전 윈도우 값을 전파
 
             left_pts.append((left_current, y_center))
