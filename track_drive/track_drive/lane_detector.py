@@ -26,10 +26,10 @@ WHITE_H_MIN, WHITE_H_MAX = 0, 180
 WHITE_S_MIN, WHITE_S_MAX = 0, 40
 WHITE_V_MIN, WHITE_V_MAX = 150, 255
 
-# HSV 색공간 임계값 - 노란색 차선 (그림자 대응을 위해 하한값 대폭 하향, 상한값 H_MAX 38로 확장)
-YELLOW_H_MIN, YELLOW_H_MAX = 10, 38
-YELLOW_S_MIN, YELLOW_S_MAX = 30, 255
-YELLOW_V_MIN, YELLOW_V_MAX = 30, 255
+# HSV 색공간 임계값 - 노란색 차선 (친구 코드 15~45 반영 및 그림자 방어용 S/V 70 조정)
+YELLOW_H_MIN, YELLOW_H_MAX = 15, 45
+YELLOW_S_MIN, YELLOW_S_MAX = 70, 255
+YELLOW_V_MIN, YELLOW_V_MAX = 70, 255
 
 class LaneDetector:
     """
@@ -70,7 +70,7 @@ class LaneDetector:
         # 각 윈도우(0~9)별 예상 차선폭 초기값 (바닥은 180, 꼭대기는 80으로 원근 수렴하는 구조)
         self.lane_widths = [int(180 - (180 - 80) * (i / (NUM_WINDOWS - 1))) for i in range(NUM_WINDOWS)]
 
-    def detect(self, image, lookahead_distance=1.2):
+    def detect(self, image, lookahead_distance=1.2, is_curve=False):
         """
         카메라 영상을 BEV로 변환하여 동적 Lookahead 거리에서의 물리적 오프셋 e_y(m)와 
         전방 도로 곡률(curvature)을 반환합니다.
@@ -131,12 +131,11 @@ class LaneDetector:
 
         # 4. 슬라이딩 윈도우 추적 (노란색/흰색 분리 감지 적용)
         left_pts, right_pts, center_pts, debug_bev = self._sliding_window_bev(
-            white_mask, yellow_mask, combined_mask, bev_img.copy()
+            white_mask, yellow_mask, combined_mask, bev_img.copy(), is_curve
         )
 
         # 전방 도로 곡률(Curvature) 계산: 최상단, 최하단, 중간 영역 대표값의 선형 편차(2차 미분 유사) 계산
-        # 단순 x축 편차만 계산하면 차량의 헤딩 오차(Heading Error)가 곡률로 잘못 인식되는 문제를 방지합니다.
-        # 최상단 윈도우(인덱스 9)는 이미지 상부 왜곡 및 노이즈가 극심하므로 제외하고 0~8번 윈도우로 계산 대역을 하향 안정화합니다.
+        # 너무 먼 거리를 보면(예: 7~9번 윈도우) 투영 왜곡으로 인해 곡률 값이 크게 흔들릴 수 있어 안정적인 6~8번 대역으로 복구합니다.
         top_x = np.mean([pts[0] for pts in center_pts[6:9]])   # 6, 7, 8번 윈도우 평균
         bottom_x = np.mean([pts[0] for pts in center_pts[0:3]])# 0, 1, 2번 윈도우 평균
         mid_x = np.mean([pts[0] for pts in center_pts[3:6]])   # 3, 4, 5번 윈도우 평균
@@ -165,9 +164,14 @@ class LaneDetector:
             self.no_lane_count = 0
 
         # 7. 디버그 오버레이 시각화 생성
-        # 원본 이미지에 초록색 BEV ROI 영역 다각형 그리기
+        # 원본 이미지에 초록색 BEV ROI 영역 다각형 그리기 (사다리꼴 형태로 순서 조정)
         debug_orig = image.copy()
-        src_draw = self.src_pts.astype(np.int32)
+        src_draw = np.array([
+            self.src_pts[0],  # 좌상단
+            self.src_pts[1],  # 우상단
+            self.src_pts[3],  # 우하단
+            self.src_pts[2]   # 좌하단
+        ], dtype=np.int32)
         cv2.polylines(debug_orig, [src_draw], isClosed=True, color=(0, 255, 0), thickness=2)
 
         # BEV 디버그 이미지 상에 목표값 시각화
@@ -208,7 +212,7 @@ class LaneDetector:
         upper = np.array([YELLOW_H_MAX, YELLOW_S_MAX, YELLOW_V_MAX])
         return cv2.inRange(hsv, lower, upper)
 
-    def _sliding_window_bev(self, white_mask, yellow_mask, combined_mask, debug_img):
+    def _sliding_window_bev(self, white_mask, yellow_mask, combined_mask, debug_img, is_curve=False):
         """BEV 상에서 슬라이딩 윈도우 기법을 적용하여 좌우 차선을 검출하고 추적합니다."""
         h, w = combined_mask.shape
         
@@ -227,22 +231,31 @@ class LaneDetector:
             right_base = self.prev_right_x
             midpoint = w // 2
             
+            # 곡선 모드일 경우 추적 마진을 넓혀 차선 이탈을 방지
+            search_margin = 300 if is_curve else 150
+            
             if num_yellow > 50:
-                # 노란색 중앙선도 우측 흰선처럼 이전 프레임 위치 기준 주변 ±150 픽셀 영역에서 추적하여 노이즈(예: 바닥 글씨 등) 회피
+                # 노란색 중앙선도 우측 흰선처럼 이전 프레임 위치 기준 주변 ±search_margin 픽셀 영역에서 추적하여 노이즈 회피
                 if self.prev_left_x == int(w * 0.2):
                     search_end = midpoint - 20
                     left_hist = np.sum(left_mask[h // 2:, :search_end], axis=0)
                     if np.max(left_hist) > 10:
                         left_base = np.argmax(left_hist)
                 else:
-                    l_min = max(0, self.prev_left_x - 150)
-                    l_max = min(w, self.prev_left_x + 150)
+                    l_min = max(0, self.prev_left_x - search_margin)
+                    l_max = min(w, self.prev_left_x + search_margin)
                     left_hist = np.sum(left_mask[h // 2:, l_min:l_max], axis=0)
                     if np.max(left_hist) > 10:
                         left_base = np.argmax(left_hist) + l_min
+                    else:
+                        # [추적 실패 시 리셋] 탐색 구역 내에 없으면 왼쪽 절반 전체(+여유분)에서 다시 탐색하여 구석 고착 방지
+                        search_end = midpoint + 50
+                        left_hist_global = np.sum(left_mask[h // 2:, :search_end], axis=0)
+                        if np.max(left_hist_global) > 10:
+                            left_base = np.argmax(left_hist_global)
                         
             if num_white > 50:
-                # 우측 흰색 실선은 이전 프레임 위치 기준 주변 ±150 픽셀 영역에서 추적 (좌측 흰선 오인 차단)
+                # 우측 흰색 실선은 이전 프레임 위치 기준 주변 ±search_margin 픽셀 영역에서 추적 (좌측 흰선 오인 차단)
                 # 초기 프레임(또는 이전 정보가 기본값일 때)에는 중앙 영역부터 오른쪽 끝까지 검색
                 if self.prev_right_x == int(w * 0.8):
                     search_start = midpoint - 40
@@ -250,11 +263,17 @@ class LaneDetector:
                     if np.max(right_hist) > 10:
                         right_base = np.argmax(right_hist) + search_start
                 else:
-                    r_min = max(0, self.prev_right_x - 150)
-                    r_max = min(w, self.prev_right_x + 150)
+                    r_min = max(0, self.prev_right_x - search_margin)
+                    r_max = min(w, self.prev_right_x + search_margin)
                     right_hist = np.sum(right_mask[h // 2:, r_min:r_max], axis=0)
                     if np.max(right_hist) > 10:
                         right_base = np.argmax(right_hist) + r_min
+                    else:
+                        # [추적 실패 시 리셋] 탐색 구역 내에 없으면 오른쪽 절반 전체(-여유분)에서 다시 탐색
+                        search_start = midpoint - 50
+                        right_hist_global = np.sum(right_mask[h // 2:, search_start:], axis=0)
+                        if np.max(right_hist_global) > 10:
+                            right_base = np.argmax(right_hist_global) + search_start
         else:
             # 올화이트 차선 또는 노란색/흰색 모두 검출 안됨
             left_mask = combined_mask

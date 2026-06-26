@@ -25,6 +25,7 @@ setup(
     entry_points={
         'console_scripts': [
             'track_drive = track_drive.track_drive:main',
+            'track_drive_cone = track_drive.track_drive_cone:main',
             'drive = track_drive.drive:main'
         ],
     },
